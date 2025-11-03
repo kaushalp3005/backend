@@ -1292,6 +1292,112 @@ def get_transfer_details(
 
 
 # ============================================
+# DELETE TRANSFER
+# ============================================
+@router.delete("/transfers/{transfer_id}")
+def delete_transfer(transfer_id: int, db: Session = Depends(get_db)):
+    """
+    Delete a transfer and all its related data (lines, boxes)
+    """
+    try:
+        logger.info("=" * 80)
+        logger.info(f"Deleting transfer ID: {transfer_id}")
+        
+        # Get transfer header to check if exists
+        transfer = db.execute(
+            text("""
+                SELECT id, challan_no, status
+                FROM interunit_transfers_header
+                WHERE id = :transfer_id
+            """),
+            {"transfer_id": transfer_id}
+        ).fetchone()
+        
+        if not transfer:
+            raise HTTPException(status_code=404, detail="Transfer not found")
+        
+        # Check if transfer can be deleted (only if not received/completed)
+        if transfer.status in ['Received', 'Completed']:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Cannot delete transfer with status '{transfer.status}'. Only pending transfers can be deleted."
+            )
+        
+        # Delete boxes first (foreign key constraint) - try both possible table names
+        boxes_deleted = False
+        try:
+            db.execute(
+                text("""
+                    DELETE FROM interunit_scanned_boxes
+                    WHERE header_id = :transfer_id
+                """),
+                {"transfer_id": transfer_id}
+            )
+            boxes_deleted = True
+            logger.info("Deleted boxes from interunit_scanned_boxes")
+        except Exception as box_error:
+            logger.warning(f"Could not delete from interunit_scanned_boxes: {box_error}")
+            db.rollback()  # Rollback failed transaction
+            # Try alternative table name
+            try:
+                db.execute(
+                    text("""
+                        DELETE FROM scanned_boxes
+                        WHERE header_id = :transfer_id
+                    """),
+                    {"transfer_id": transfer_id}
+                )
+                boxes_deleted = True
+                logger.info("Deleted boxes from scanned_boxes")
+            except Exception as alt_error:
+                logger.warning(f"Could not delete from scanned_boxes either: {alt_error}")
+                db.rollback()  # Rollback failed transaction
+                # Continue without deleting boxes if table doesn't exist
+        
+        if not boxes_deleted:
+            logger.info("No boxes table found, continuing without box deletion")
+        
+        # Delete lines
+        db.execute(
+            text("""
+                DELETE FROM interunit_transfers_lines
+                WHERE header_id = :transfer_id
+            """),
+            {"transfer_id": transfer_id}
+        )
+        logger.info("Deleted transfer lines")
+        
+        # Delete header
+        db.execute(
+            text("""
+                DELETE FROM interunit_transfers_header
+                WHERE id = :transfer_id
+            """),
+            {"transfer_id": transfer_id}
+        )
+        logger.info("Deleted transfer header")
+        
+        db.commit()
+        
+        logger.info(f"✅ Transfer {transfer.challan_no} and related data deleted successfully")
+        logger.info("=" * 80)
+        
+        return {
+            "success": True,
+            "message": "Transfer deleted successfully",
+            "transfer_id": transfer_id,
+            "challan_no": transfer.challan_no
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting transfer: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete transfer: {str(e)}")
+
+
+# ============================================
 # CONFIRM TRANSFER RECEIPT (Transfer IN)
 # ============================================
 @router.put("/transfers/{transfer_id}/confirm")
